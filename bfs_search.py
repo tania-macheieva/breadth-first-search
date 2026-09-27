@@ -36,11 +36,13 @@ def build_radial_graph(branch_lengths, cross_links=(), tree_only=False,
 
 
 def make_tree_A():
+    """Дерево: 30 вершин, 29 ребер, 5 гілок (ациклічне)."""
     nodes, edges, branches, n = build_radial_graph([6, 6, 5, 5, 7], tree_only=True)
     return nodes, edges, n, "Дерево (5 гілок)"
 
 
 def make_graph_B():
+    """Граф середнього розміру: 32 вершини, 37 ребер, 5 гілок + перехресні ребра."""
     cross = [(0, 5, 1, 5), (2, 4, 3, 4), (3, 4, 4, 4), (0, 2, 1, 2), (2, 2, 3, 2)]
     nodes, edges, branches, n = build_radial_graph([6, 6, 5, 5, 7], cross_links=cross)
     extra = n
@@ -54,6 +56,7 @@ def make_graph_B():
 
 
 def make_graph_C():
+    """Великий граф: 53 вершини, 62 ребра, 8 гілок - для дослідження впливу розміру/порядку."""
     lengths = [7, 7, 6, 6, 7, 7, 6, 6]
     cross = [(0, 6, 1, 6), (2, 5, 3, 5), (4, 6, 5, 6), (6, 5, 7, 5),
               (0, 3, 4, 3), (1, 3, 5, 3), (2, 2, 6, 2), (3, 2, 7, 2),
@@ -83,9 +86,13 @@ DIRECTION_MODES = {
 }
 
 
-def build_adjacency(edges, n_nodes, direction_mode):
-    adj = {i: [] for i in range(n_nodes)}
+def build_adjacency(edges, node_ids, direction_mode):
+    if isinstance(node_ids, int):
+        node_ids = range(node_ids)
+    adj = {i: [] for i in node_ids}
     for (u, v) in edges:
+        if u not in adj or v not in adj:
+            continue
         if direction_mode == "undirected":
             adj[u].append(v)
             adj[v].append(u)
@@ -146,11 +153,10 @@ def bfs_search(adj, start, target, order_mode):
         "time_ms": elapsed_ms,
     }
 
-
 COLOR_IDLE = "#c9d6e3"
-COLOR_QUEUE = "#f5d76e"  
-COLOR_CURRENT = "#e8743b" 
-COLOR_VISITED = "#8aa6c1" 
+COLOR_QUEUE = "#f5d76e"
+COLOR_CURRENT = "#e8743b"
+COLOR_VISITED = "#8aa6c1"
 COLOR_START = "#2e86de"
 COLOR_TARGET = "#c0392b"
 COLOR_PATH = "#27ae60"
@@ -179,6 +185,8 @@ class BFSApp:
         self.edge_items = []
         self.animating = False
         self.anim_job = None
+        self._edit_first_node = None
+        self._drag_node = None
 
         self._build_layout()
         self._load_preset()
@@ -188,6 +196,7 @@ class BFSApp:
         main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True)
 
+        # --- ліва панель керування ---
         panel = ttk.Frame(main, padding=10)
         panel.pack(side="left", fill="y")
 
@@ -244,6 +253,33 @@ class BFSApp:
         ttk.Button(panel, text="Порівняти варіанти графів", command=self._run_comparison).pack(fill="x", pady=3)
         ttk.Button(panel, text="Довідка: переваги/недоліки BFS", command=self._show_help).pack(fill="x", pady=3)
 
+        # --- редагування графа ---
+        edit_box = ttk.LabelFrame(panel, text="Редагування графа (клік по полотну)", padding=6)
+        edit_box.pack(fill="x", pady=(12, 0))
+
+        self.edit_mode = tk.StringVar(value="none")
+        self._edit_mode_names = {
+            "none": "Перегляд (без редагування)",
+            "add_vertex": "Додати вершину (клік по пустому місцю)",
+            "del_vertex": "Видалити вершину (клік по ній)",
+            "add_edge": "Додати ребро (клік 2 вершини)",
+            "del_edge": "Видалити ребро (клік 2 вершини)",
+            "move_vertex": "Перемістити вершину (тягнути мишею)",
+        }
+        self.edit_mode_combo = ttk.Combobox(edit_box, state="readonly", width=30,
+                                             values=list(self._edit_mode_names.values()))
+        self.edit_mode_combo.set(self._edit_mode_names["none"])
+        self.edit_mode_combo.pack(anchor="w", fill="x", pady=(0, 6))
+        self._edit_mode_name_to_key = {v: k for k, v in self._edit_mode_names.items()}
+        self.edit_mode_combo.bind("<<ComboboxSelected>>", self._on_edit_mode_change)
+
+        self.edit_status_var = tk.StringVar(value="")
+        ttk.Label(edit_box, textvariable=self.edit_status_var, wraplength=260,
+                  foreground="#8a4b00").pack(anchor="w", pady=(0, 6))
+
+        ttk.Button(edit_box, text="Новий порожній граф", command=self._new_empty_graph).pack(fill="x", pady=2)
+        ttk.Button(edit_box, text="Скасувати поточний вибір", command=self._edit_reset_selection).pack(fill="x", pady=2)
+
         ttk.Separator(panel).pack(fill="x", pady=6)
         self.status_var = tk.StringVar(value="Готово.")
         ttk.Label(panel, textvariable=self.status_var, wraplength=260, foreground="#333").pack(anchor="w")
@@ -257,10 +293,14 @@ class BFSApp:
         self._legend_row(legend, COLOR_VISITED, "розкрита (оброблена)")
         self._legend_row(legend, COLOR_PATH, "вершина/ребро шляху")
 
+        # --- полотно ---
         canvas_frame = ttk.Frame(main)
         canvas_frame.pack(side="left", fill="both", expand=True)
         self.canvas = tk.Canvas(canvas_frame, bg="white", width=1000, height=860)
         self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
 
     def _legend_row(self, parent, color, text):
         row = ttk.Frame(parent)
@@ -287,13 +327,36 @@ class BFSApp:
         name = self.preset_combo.get()
         key = self._preset_name_to_key.get(name, "graph")
         self.nodes, self.edges, self.n_nodes, _label = PRESETS[key]()
-        values = [str(i) for i in range(self.n_nodes)]
+        self.edges = [tuple(e) for e in self.edges]
+        self._refresh_start_target_values(reset=True)
+        self.status_var.set(f"Граф завантажено: {self.n_nodes} вершин, {len(self.edges)} ребер.")
+        self._edit_reset_selection()
+        self._redraw()
+
+    def _new_empty_graph(self):
+        self._stop_animation()
+        self.nodes = {0: (500, 430)}
+        self.edges = []
+        self.n_nodes = 1
+        self._refresh_start_target_values(reset=True)
+        self.status_var.set("Створено порожній граф (1 вершина). Додавайте вершини й ребра в режимі редагування.")
+        self._edit_reset_selection()
+        self._redraw()
+
+    def _refresh_start_target_values(self, reset=False):
+        ids = sorted(self.nodes.keys())
+        values = [str(i) for i in ids]
+        cur_start = self.start_combo.get() if hasattr(self, "start_combo") else None
+        cur_target = self.target_combo.get() if hasattr(self, "target_combo") else None
         self.start_combo["values"] = values
         self.target_combo["values"] = values
-        self.start_combo.set("0")
-        self.target_combo.set(values[-1])
-        self.status_var.set(f"Граф завантажено: {self.n_nodes} вершин, {len(self.edges)} ребер.")
-        self._redraw()
+        if reset or not values:
+            if values:
+                self.start_combo.set(values[0])
+                self.target_combo.set(values[-1])
+        else:
+            self.start_combo.set(cur_start if cur_start in values else values[0])
+            self.target_combo.set(cur_target if cur_target in values else values[-1])
 
     def _current_direction_key(self):
         return self._dir_name_to_key.get(self.dir_combo.get(), "undirected")
@@ -352,6 +415,122 @@ class BFSApp:
         oval, _ = self.node_items[nid]
         self.canvas.itemconfig(oval, fill=color)
 
+    # ------------------------------------------------------------- editing
+    def _on_edit_mode_change(self, event=None):
+        self._edit_reset_selection()
+        mode = self._current_edit_mode()
+        hints = {
+            "none": "",
+            "add_vertex": "Клацніть по вільному місцю на полотні, щоб додати нову вершину.",
+            "del_vertex": "Клацніть по вершині, щоб видалити її (разом з усіма її ребрами).",
+            "add_edge": "Клацніть по першій, потім по другій вершині, щоб з'єднати їх ребром.",
+            "del_edge": "Клацніть по двом вершинам існуючого ребра, щоб видалити це ребро.",
+            "move_vertex": "Затисніть ліву кнопку миші на вершині й перетягніть у нове місце.",
+        }
+        self.edit_status_var.set(hints.get(mode, ""))
+
+    def _current_edit_mode(self):
+        return self._edit_mode_name_to_key.get(self.edit_mode_combo.get(), "none")
+
+    def _edit_reset_selection(self):
+        self._edit_first_node = None
+        self._drag_node = None
+
+    def _node_at(self, x, y, tolerance=6):
+        """Повертає id вершини під курсором (з невеликим допуском), або None."""
+        best_id, best_d = None, None
+        for nid, (nx, ny) in self.nodes.items():
+            d = math.hypot(nx - x, ny - y)
+            if d <= NODE_R + tolerance and (best_d is None or d < best_d):
+                best_id, best_d = nid, d
+        return best_id
+
+    def _next_free_id(self):
+        return (max(self.nodes.keys()) + 1) if self.nodes else 0
+
+    def _on_canvas_click(self, event):
+        mode = self._current_edit_mode()
+        if mode == "none":
+            return
+        x, y = event.x, event.y
+        clicked = self._node_at(x, y)
+
+        if mode == "add_vertex":
+            if clicked is not None:
+                self.edit_status_var.set("Тут уже є вершина. Клацніть по вільному місцю.")
+                return
+            new_id = self._next_free_id()
+            self.nodes[new_id] = (x, y)
+            self.n_nodes = len(self.nodes)
+            self._refresh_start_target_values()
+            self.status_var.set(f"Додано вершину {new_id}. Усього вершин: {self.n_nodes}.")
+            self._redraw()
+
+        elif mode == "del_vertex":
+            if clicked is None:
+                self.edit_status_var.set("Клацніть точно по вершині, яку треба видалити.")
+                return
+            del self.nodes[clicked]
+            self.edges = [(u, v) for (u, v) in self.edges if u != clicked and v != clicked]
+            self.n_nodes = len(self.nodes)
+            self._refresh_start_target_values()
+            self.status_var.set(f"Вершину {clicked} видалено разом з інцидентними ребрами. "
+                                 f"Залишилось: {self.n_nodes} вершин, {len(self.edges)} ребер.")
+            self._redraw()
+
+        elif mode == "add_edge":
+            if clicked is None:
+                self.edit_status_var.set("Клацніть по вершині (не по пустому місцю).")
+                return
+            if self._edit_first_node is None:
+                self._edit_first_node = clicked
+                self.edit_status_var.set(f"Обрано вершину {clicked}. Клацніть другу вершину для ребра.")
+                self._redraw(node_colors={clicked: COLOR_QUEUE})
+            else:
+                u = self._edit_first_node
+                v = clicked
+                self._edit_first_node = None
+                if u == v:
+                    self.edit_status_var.set("Не можна з'єднати вершину саму з собою.")
+                elif (u, v) in self.edges or (v, u) in self.edges:
+                    self.edit_status_var.set(f"Ребро {u}-{v} вже існує.")
+                else:
+                    self.edges.append((u, v))
+                    self.status_var.set(f"Додано ребро {u}-{v}. Усього ребер: {len(self.edges)}.")
+                self._redraw()
+
+        elif mode == "del_edge":
+            if clicked is None:
+                self.edit_status_var.set("Клацніть по вершині (не по пустому місцю).")
+                return
+            if self._edit_first_node is None:
+                self._edit_first_node = clicked
+                self.edit_status_var.set(f"Обрано вершину {clicked}. Клацніть другу вершину ребра для видалення.")
+                self._redraw(node_colors={clicked: COLOR_TARGET})
+            else:
+                u = self._edit_first_node
+                v = clicked
+                self._edit_first_node = None
+                before = len(self.edges)
+                self.edges = [e for e in self.edges if e != (u, v) and e != (v, u)]
+                if len(self.edges) == before:
+                    self.edit_status_var.set(f"Ребра між {u} і {v} не знайдено.")
+                else:
+                    self.status_var.set(f"Ребро {u}-{v} видалено. Залишилось ребер: {len(self.edges)}.")
+                self._redraw()
+
+        elif mode == "move_vertex":
+            self._drag_node = clicked
+
+    def _on_canvas_drag(self, event):
+        if self._current_edit_mode() != "move_vertex" or self._drag_node is None:
+            return
+        self.nodes[self._drag_node] = (event.x, event.y)
+        self._redraw()
+
+    def _on_canvas_release(self, event):
+        self._drag_node = None
+
     # ------------------------------------------------------------- search
     def _stop_animation(self):
         self.animating = False
@@ -370,9 +549,14 @@ class BFSApp:
             messagebox.showwarning("Увага", "Оберіть початкову й цільову вершини.")
             return
 
+        if start not in self.nodes or target not in self.nodes:
+            messagebox.showwarning("Увага", "Обрана вершина більше не існує в графі.")
+            return
+
         direction = self._current_direction_key()
         order = self._current_order_key()
-        adj = build_adjacency(self.edges, self.n_nodes, direction)
+        self.n_nodes = len(self.nodes)
+        adj = build_adjacency(self.edges, self.nodes.keys(), direction)
         result = bfs_search(adj, start, target, order)
         self._last_result = result
 
@@ -404,8 +588,10 @@ class BFSApp:
         elif kind == "dequeue":
             self._set_node_color(node, COLOR_CURRENT)
             if idx > 0:
+                # повернути попередню "поточну" у стан "розкрита", якщо це не старт/ціль
                 pass
 
+        # трохи згодом перефарбувати попередню "поточну" вершину в "розкрита"
         delay = 0 if self.instant.get() else max(5, int(self.speed_ms.get()))
         self.anim_job = self.root.after(delay, lambda: self._post_step(events, idx))
 
